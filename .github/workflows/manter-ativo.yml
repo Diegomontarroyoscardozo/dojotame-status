@@ -1,0 +1,24 @@
+# O GitHub desliga workflows agendados de repositório público após 60 dias sem atividade.
+# Um commit vazio por mês mantém o monitor (saude.yml) ligado.
+name: Manter monitor ativo
+
+on:
+  schedule:
+    - cron: "0 12 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  manter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit vazio
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: manter workflows agendados ativos"
+          git push

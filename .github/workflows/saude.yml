@@ -1,0 +1,93 @@
+# Monitor da produção do DojoTame (https://jiujitsu-saas-iota.vercel.app).
+#
+# - A cada 15 min: /login (só a aplicação; sem cookie de sessão, não consulta o banco).
+# - Na primeira execução de cada hora: também /api/saude (faz SELECT 1 no banco). O banco do Neon
+#   no plano gratuito tem 100 CU-horas/mês e "dorme" após 5 min ocioso; checá-lo a cada 15 min o
+#   manteria acordado quase o tempo todo (~60 CU-h/mês). De hora em hora custa ~15 CU-h/mês.
+# - Falha só depois de 3 tentativas com 30 s de intervalo (evita alarme por instabilidade passageira).
+# - Em falha: o job falha (o GitHub avisa por e-mail) e abre/atualiza uma issue "incidente".
+#   Quando volta ao normal, a issue é fechada com o horário da recuperação.
+# - Roteiro de resposta: docs/13-RESPOSTA-A-INCIDENTES.md no repositório do sistema.
+name: Saúde da produção
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      checar_banco:
+        description: "Checar também /api/saude (banco)"
+        type: boolean
+        default: true
+
+permissions:
+  issues: write
+
+concurrency:
+  group: saude
+  cancel-in-progress: false
+
+env:
+  URL_BASE: https://jiujitsu-saas-iota.vercel.app
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verificar a produção
+        id: checar
+        env:
+          CHECAR_BANCO_MANUAL: ${{ inputs.checar_banco }}
+        run: |
+          set -u
+          minuto=$(date -u +%M)
+          checar_banco=false
+          if [ "${CHECAR_BANCO_MANUAL:-}" = "true" ] || [ "$minuto" -lt 15 ]; then checar_banco=true; fi
+
+          ok=0
+          for tentativa in 1 2 3; do
+            login=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$URL_BASE/login" || true)
+            detalhe="/login=$login"
+            passou=false
+            [ "$login" = "200" ] && passou=true
+            if [ "$checar_banco" = true ]; then
+              saude=$(curl -s -o /tmp/saude.json -w '%{http_code}' --max-time 20 "$URL_BASE/api/saude" || true)
+              corpo=$(tr -d '\n' < /tmp/saude.json 2>/dev/null || true)
+              detalhe="$detalhe /api/saude=$saude $corpo"
+              if [ "$saude" != "200" ] || ! echo "$corpo" | grep -q '"status":"ok"'; then passou=false; fi
+            fi
+            echo "tentativa $tentativa (banco: $checar_banco): $detalhe"
+            if [ "$passou" = true ]; then ok=1; break; fi
+            [ "$tentativa" -lt 3 ] && sleep 30
+          done
+
+          echo "detalhe=$detalhe" >> "$GITHUB_OUTPUT"
+          [ "$ok" = 1 ]
+
+      - name: Abrir ou atualizar issue de incidente
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DETALHE: ${{ steps.checar.outputs.detalhe }}
+        run: |
+          agora=$(date -u +%Y-%m-%dT%H:%MZ)
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incidente --state open --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$agora — ainda falhando: \`$DETALHE\`"
+          else
+            gh label create incidente --repo "$GITHUB_REPOSITORY" --color B60205 --description "Produção fora do ar ou degradada" 2>/dev/null || true
+            gh issue create --repo "$GITHUB_REPOSITORY" --label incidente \
+              --title "Produção fora do ar ou degradada ($agora)" \
+              --body "$(printf 'Detectado em %s (UTC) após 3 tentativas.\n\nResultado: `%s`\n\nExecução: %s/%s/actions/runs/%s\n\nRoteiro: docs/13-RESPOSTA-A-INCIDENTES.md no repositório jiujitsu-saas.' "$agora" "$DETALHE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          fi
+
+      - name: Fechar issue de incidente quando voltar ao normal
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --label incidente --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$n" ]; then
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "Recuperado: verificação ok em $(date -u +%Y-%m-%dT%H:%MZ) (UTC)."
+          fi
